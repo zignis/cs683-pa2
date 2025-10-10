@@ -1,0 +1,188 @@
+#include "cache.h"
+#include <cstdint>
+#include <iostream>
+
+#define TABLE_SIZE 64
+#define MAX_OFFSETS_PER_PAGE 5
+
+using namespace std;
+
+struct Offset
+{
+    int64_t offset;
+    uint32_t frequency;
+    uint32_t useful;
+    uint32_t issued;
+};
+
+struct Page
+{
+    uint64_t num;
+    Offset offsets[MAX_OFFSETS_PER_PAGE];
+    uint64_t prev_line_addr;
+    uint32_t lru;
+};
+
+Page offset_table[TABLE_SIZE];
+
+uint64_t get_line_addr(uint64_t addr) { return addr >> LOG2_BLOCK_SIZE; }
+
+uint64_t get_page_num(uint64_t addr) { return addr >> LOG2_PAGE_SIZE; }
+
+int get_prefetch_degree(float accuracy)
+{
+    return (accuracy > 0.5) ? 3 : (accuracy > 0.25) ? 2
+                                                    : 1;
+}
+
+void CACHE::l2c_prefetcher_initialize()
+{
+    cout << "[cpu] " << cpu << " l2 offset prefetcher" << endl;
+    for (int i = 0; i < TABLE_SIZE; i++)
+        offset_table[i].lru = i;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                       uint8_t cache_hit, uint8_t type,
+                                       uint32_t metadata_in,
+                                       uint8_t critical_ip_flag)
+{
+    uint64_t line_addr = get_line_addr(addr);
+    uint64_t page_num = get_page_num(addr);
+
+    int idx = -1;
+    for (int i = 0; i < TABLE_SIZE; i++)
+    {
+        if (offset_table[i].num == page_num)
+        {
+            idx = i;
+            break;
+        }
+    }
+
+    // no entry match
+    if (idx == -1)
+    {
+        for (int i = 0; i < TABLE_SIZE; i++)
+        {
+            if (offset_table[i].lru == TABLE_SIZE - 1)
+            {
+                idx = i;
+                break;
+            }
+        }
+
+        offset_table[idx].num = page_num;
+        memset(offset_table[idx].offsets, 0, sizeof(offset_table[idx].offsets));
+    }
+
+    int64_t offset = line_addr - offset_table[idx].prev_line_addr;
+    offset_table[idx].prev_line_addr = line_addr;
+
+    if (offset == 0)
+        return metadata_in;
+
+    // bump freq
+    bool found = false;
+    for (int i = 0; i < MAX_OFFSETS_PER_PAGE; i++)
+    {
+        if (offset_table[idx].offsets[i].offset == offset)
+        {
+            offset_table[idx].offsets[i].frequency++;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        int min_freq_idx = 0;
+        for (int i = 1; i < MAX_OFFSETS_PER_PAGE; i++)
+        {
+            if (offset_table[idx].offsets[i].frequency <
+                offset_table[idx].offsets[min_freq_idx].frequency)
+                min_freq_idx = i;
+        }
+
+        offset_table[idx].offsets[min_freq_idx] = {offset, 1, 0, 0};
+    }
+
+    // prefetching
+    for (int i = 0; i < MAX_OFFSETS_PER_PAGE; i++)
+    {
+        Offset &entry = offset_table[idx].offsets[i];
+
+        if (entry.frequency == 0)
+            continue;
+
+        float accuracy =
+            (entry.issued > 0) ? (float)entry.useful / entry.issued : 0.0;
+
+        for (int j = 0; j < get_prefetch_degree(accuracy); j++)
+        {
+            uint64_t prefetch_line_addr = line_addr + entry.offset * (j + 1);
+            uint64_t prefetch_addr = prefetch_line_addr << LOG2_BLOCK_SIZE;
+
+            if (get_page_num(prefetch_addr) == page_num)
+            {
+                entry.issued++;
+                if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                {
+                    prefetch_line(ip, addr, prefetch_addr, FILL_L2, 0);
+                }
+                else
+                {
+                    prefetch_line(ip, addr, prefetch_addr, FILL_LLC, 0);
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+
+    // update lru
+    for (int i = 0; i < TABLE_SIZE; i++)
+    {
+        if (offset_table[i].lru < offset_table[idx].lru)
+            offset_table[i].lru++;
+    }
+    offset_table[idx].lru = 0;
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set,
+                                          uint32_t match, uint8_t prefetch,
+                                          uint64_t evicted_addr,
+                                          uint32_t metadata_in)
+{
+    if (prefetch)
+    {
+        for (int i = 0; i < TABLE_SIZE; i++)
+        {
+            if (offset_table[i].num == get_page_num(addr))
+            {
+                for (int j = 0; j < MAX_OFFSETS_PER_PAGE; j++)
+                {
+                    if (offset_table[i].offsets[j].offset != 0 &&
+                        get_line_addr(addr) == offset_table[i].prev_line_addr +
+                                                   offset_table[i].offsets[j].offset)
+                    {
+                        offset_table[i].offsets[j].useful++;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "[cpu] " << cpu << " prefetcher stats" << endl;
+}
